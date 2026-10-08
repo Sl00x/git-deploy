@@ -1,0 +1,97 @@
+[project]
+name = "udeploy"
+version = "0.1.0"
+description = "Universal self-hosted CI/CD deployment engine for Docker Engine + Compose V2 (no Kubernetes)."
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "Proprietary" }
+dependencies = [
+    "pydantic>=2.9,<3",
+    "pyyaml>=6.0.2",
+    "httpx>=0.28",
+    "cryptography>=44",
+]
+
+[project.optional-dependencies]
+control-plane = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "pydantic-settings>=2.6",
+    "sqlalchemy[asyncio]>=2.0.36",
+    "asyncpg>=0.30",
+    "alembic>=1.14",
+    "celery[redis]>=5.4",
+    "redis>=5.2",
+]
+agent = []
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+    "testcontainers[postgres,redis]>=4.9",
+    "ruff>=0.8",
+    "mypy>=1.14",
+    "types-PyYAML",
+    "psycopg2-binary>=2.9",
+]
+
+[project.scripts]
+udeploy-admin = "udeploy_api.cli:main"
+udeploy-agent = "udeploy_agent.main:main"
+
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "apps/api/udeploy_api",
+    "apps/worker/udeploy_worker",
+    "agent/udeploy_agent",
+    "packages/domain/udeploy_domain",
+    "packages/providers/udeploy_providers",
+    "packages/planner/udeploy_planner",
+    "packages/compose_renderer/udeploy_compose",
+    "packages/security/udeploy_security",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "ASYNC", "RUF"]
+ignore = ["S101", "S603", "S607", "RUF001", "RUF002", "RUF003", "B008", "UP047", "ASYNC109", "RUF012", "S105"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S105", "S106", "S108", "S311", "E501", "B023", "RUF043", "RUF007", "RUF059", "ASYNC110"]
+"migrations/**" = ["E501"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+plugins = ["pydantic.mypy"]
+mypy_path = "apps/api:apps/worker:agent:packages/domain:packages/providers:packages/planner:packages/compose_renderer:packages/security"
+explicit_package_bases = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+testpaths = ["tests"]
+markers = [
+    "integration: needs Docker (testcontainers)",
+    "e2e: drives a real Docker Engine through the agent",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+    "udeploy_api", "udeploy_worker", "udeploy_agent", "udeploy_domain", "udeploy_providers",
+    "udeploy_planner", "udeploy_compose", "udeploy_security",
+]
+
+[[tool.mypy.overrides]]
+module = ["udeploy_worker.*"]
+disable_error_code = ["untyped-decorator"]

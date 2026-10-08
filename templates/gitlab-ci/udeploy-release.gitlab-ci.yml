@@ -1,0 +1,140 @@
+# udeploy release pipeline for GitLab CI — template v1.
+# Include from .gitlab-ci.yml:   include: [{local: ci/udeploy-release.gitlab-ci.yml}]
+#
+# Flow: tag vX.Y.Z -> rootless BuildKit build+push -> Trivy scan by digest (fail closed)
+#       -> cosign keyless signature -> notify udeploy with the pushed DIGESTS.
+#
+# CI/CD variables (Settings > CI/CD > Variables) — mark secrets "Masked" and "Protected",
+# and protect the v* tags so only maintainers can trigger production releases:
+#   UDEPLOY_URL            https://deploy.example.com
+#   UDEPLOY_CI_TOKEN       udci_...  (masked, protected) project CI token, can only publish releases
+#   UDEPLOY_REGISTRY_REF   registry-production (registry name configured in udeploy)
+#   REGISTRY               registry.example.com   (or $CI_REGISTRY for the GitLab registry)
+#   REGISTRY_NAMESPACE     prod
+#   REGISTRY_USERNAME / REGISTRY_PASSWORD   push-only robot account (masked, protected)
+# No production credential or application secret belongs in the repository.
+
+stages: [test, build, notify]
+
+variables:
+  IMAGE_PLATFORM: linux/amd64
+
+.release_rules: &release_rules
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+.*$/'
+
+test:
+  stage: test
+  image: alpine:3.20
+  <<: *release_rules
+  script:
+    - echo "run your lint and tests here (lockfile-based install)"
+
+.build_service:
+  stage: build
+  <<: *release_rules
+  image:
+    name: moby/buildkit:v0.16.0-rootless
+    entrypoint: [""]
+  id_tokens:
+    SIGSTORE_ID_TOKEN:
+      aud: sigstore
+  variables:
+    BUILDKITD_FLAGS: --oci-worker-no-process-sandbox
+  script:
+    - set -eu
+    - REPO="$(echo "$CI_PROJECT_NAME" | tr '[:upper:]' '[:lower:]')"
+    - VERSION="${CI_COMMIT_TAG#v}"
+    - IMAGE_PATH="${REGISTRY_NAMESPACE}/${REPO}_${SERVICE}"
+    - IMAGE="${REGISTRY}/${IMAGE_PATH}"
+    - mkdir -p ~/.docker artifact
+    - AUTH="$(printf '%s:%s' "$REGISTRY_USERNAME" "$REGISTRY_PASSWORD" | base64 | tr -d '\n')"
+    - printf '{"auths":{"%s":{"auth":"%s"}}}' "$REGISTRY" "$AUTH" > ~/.docker/config.json
+    - >
+      buildctl-daemonless.sh build
+      --frontend dockerfile.v0
+      --local context="$BUILD_CONTEXT" --local dockerfile="$(dirname "$DOCKERFILE")"
+      --opt filename="$(basename "$DOCKERFILE")"
+      --opt platform="$IMAGE_PLATFORM"
+      --opt label:org.opencontainers.image.revision="$CI_COMMIT_SHA"
+      --opt label:org.opencontainers.image.source="$CI_PROJECT_URL"
+      --opt label:org.opencontainers.image.version="$VERSION"
+      --opt attest:sbom=
+      --opt attest:provenance=mode=max
+      --output type=image,name="$IMAGE:$VERSION",push=true
+      --metadata-file artifact/metadata.json
+    - |
+      DIGEST="$(grep -o '"containerimage.digest": *"sha256:[a-f0-9]*"' artifact/metadata.json | grep -o 'sha256:[a-f0-9]*')"
+      test -n "$DIGEST"
+      printf '%s\n%s\n%s\n' "$IMAGE" "$IMAGE_PATH" "$DIGEST" > "artifact/${SERVICE}.ref"
+  artifacts:
+    paths: [artifact/]
+    expire_in: 1 day
+
+build:api:
+  extends: .build_service
+  variables: {SERVICE: api, BUILD_CONTEXT: ., DOCKERFILE: services/api/Dockerfile}
+build:worker:
+  extends: .build_service
+  variables: {SERVICE: worker, BUILD_CONTEXT: ., DOCKERFILE: services/worker/Dockerfile}
+build:frontend:
+  extends: .build_service
+  variables: {SERVICE: frontend, BUILD_CONTEXT: frontend, DOCKERFILE: frontend/Dockerfile}
+
+scan-sign:
+  stage: notify
+  <<: *release_rules
+  image:
+    name: aquasec/trivy:0.56.2
+    entrypoint: [""]
+  id_tokens:
+    SIGSTORE_ID_TOKEN:
+      aud: sigstore
+  needs: ["build:api", "build:worker", "build:frontend"]
+  variables:
+    TRIVY_USERNAME: $REGISTRY_USERNAME
+    TRIVY_PASSWORD: $REGISTRY_PASSWORD
+    COSIGN_VERSION: v2.4.1
+  script:
+    - set -eu
+    - apk add --no-cache curl >/dev/null
+    - curl -sSfL -o /usr/local/bin/cosign "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+    - chmod +x /usr/local/bin/cosign
+    - mkdir -p signed
+    - |
+      for ref in artifact/*.ref; do
+        IMAGE="$(sed -n 1p "$ref")"; DIGEST="$(sed -n 3p "$ref")"
+        # Fail closed: any fixable HIGH/CRITICAL vulnerability stops the release.
+        trivy image --no-progress --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "${IMAGE}@${DIGEST}"
+        COSIGN_PASSWORD="" cosign sign --yes --registry-username "$REGISTRY_USERNAME" \
+          --registry-password "$REGISTRY_PASSWORD" "${IMAGE}@${DIGEST}"
+        cp "$ref" signed/
+      done
+  artifacts:
+    paths: [signed/]
+    expire_in: 1 day
+
+notify:
+  stage: notify
+  <<: *release_rules
+  image: alpine:3.20
+  needs: ["scan-sign"]
+  script:
+    - set -eu
+    - apk add --no-cache curl jq >/dev/null
+    - |
+      for ref in signed/*.ref; do
+        SERVICE="$(basename "$ref" .ref)"; IMAGE_PATH="$(sed -n 2p "$ref")"; DIGEST="$(sed -n 3p "$ref")"
+        jq -n --arg s "$SERVICE" --arg r "$UDEPLOY_REGISTRY_REF" --arg i "$IMAGE_PATH" \
+              --arg t "${CI_COMMIT_TAG#v}" --arg d "$DIGEST" \
+              '{service:$s, registry:$r, image:$i, tag:$t, digest:$d, platform:"linux/amd64",
+                scan:{status:"passed"}, signed:true}'
+      done | jq -s --arg v "${CI_COMMIT_TAG#v}" --arg sha "$CI_COMMIT_SHA" --arg tag "$CI_COMMIT_TAG" \
+               --arg b "$CI_PIPELINE_ID" --arg u "$CI_PIPELINE_URL" \
+               '{version:$v, commit_sha:$sha, tag:$tag, build_id:$b, build_url:$u, artifacts:.}' > release.json
+    - |
+      status=$(curl -sS -o response.json -w '%{http_code}' -X POST "$UDEPLOY_URL/v1/ci/artifacts/published" \
+        -H "Authorization: Bearer $UDEPLOY_CI_TOKEN" -H "Content-Type: application/json" \
+        -H "X-Request-ID: gl-$CI_PIPELINE_ID" --data-binary @release.json)
+      cat response.json
+      case "$status" in 200|202) ;; *) echo "udeploy refused the release (HTTP $status)"; exit 1 ;; esac

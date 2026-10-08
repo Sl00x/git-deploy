@@ -1,0 +1,9 @@
+agent.env
+.e2e/
+.env
+.mypy_cache/
+*.pyc
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.venv/

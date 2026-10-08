@@ -1,0 +1,141 @@
+# udeploy release pipeline for GitHub Actions — template v1.
+# Copy to .github/workflows/udeploy-release.yml and adapt the `services` matrix.
+#
+# Flow: git tag vX.Y.Z -> build (BuildKit) -> push -> Trivy scan by digest (fail closed)
+#       -> cosign keyless signature -> notify udeploy with the pushed DIGESTS.
+# udeploy then verifies every digest against the registry itself before anything is deployed.
+#
+# Repository configuration (Settings > Secrets and variables > Actions):
+#   vars.UDEPLOY_URL           https://deploy.example.com           (not secret)
+#   vars.REGISTRY              registry.example.com                 (not secret)
+#   vars.REGISTRY_NAMESPACE    prod                                 (not secret)
+#   vars.UDEPLOY_REGISTRY_REF  registry-production (registry name in udeploy)
+#   secrets.UDEPLOY_CI_TOKEN   udci_... project CI token: can ONLY publish releases of this project
+#   secrets.REGISTRY_USERNAME / secrets.REGISTRY_PASSWORD   push-only robot account
+# No production credential, host address or application secret ever goes into the repository.
+# Hardening: pin every action below to a full commit SHA in your copy.
+
+name: udeploy-release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write        # cosign keyless (Sigstore OIDC)
+
+concurrency:
+  group: udeploy-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ${{ vars.REGISTRY }}
+  NAMESPACE: ${{ vars.REGISTRY_NAMESPACE }}
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # Replace with the project's lint / unit tests (lockfile-based install).
+      - run: echo "run your lint and tests here" && test -f Dockerfile -o -d services
+
+  build:
+    needs: test
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - {service: api, context: ., dockerfile: services/api/Dockerfile}
+          - {service: worker, context: ., dockerfile: services/worker/Dockerfile}
+          - {service: frontend, context: ./frontend, dockerfile: frontend/Dockerfile}
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: "${{ github.sha }}"}
+
+      - name: Compute names
+        id: names
+        run: |
+          repo="$(echo "${GITHUB_REPOSITORY##*/}" | tr '[:upper:]' '[:lower:]')"
+          version="${GITHUB_REF_NAME#v}"
+          echo "image=${REGISTRY}/${NAMESPACE}/${repo}_${{ matrix.service }}" >> "$GITHUB_OUTPUT"
+          echo "path=${NAMESPACE}/${repo}_${{ matrix.service }}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Build and push (SBOM + provenance attestations)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: true
+          sbom: true
+          provenance: mode=max
+          tags: ${{ steps.names.outputs.image }}:${{ steps.names.outputs.version }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.names.outputs.version }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+      - name: Vulnerability scan (fail closed on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@0.28.0
+        env:
+          TRIVY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          TRIVY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        with:
+          image-ref: ${{ steps.names.outputs.image }}@${{ steps.build.outputs.digest }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign by digest (keyless)
+        run: cosign sign --yes "${{ steps.names.outputs.image }}@${{ steps.build.outputs.digest }}"
+
+      - name: Record artifact
+        run: |
+          mkdir -p artifact
+          jq -n --arg service "${{ matrix.service }}" --arg registry "${{ vars.UDEPLOY_REGISTRY_REF }}" \
+                --arg image "${{ steps.names.outputs.path }}" --arg tag "${{ steps.names.outputs.version }}" \
+                --arg digest "${{ steps.build.outputs.digest }}" \
+                '{service:$service, registry:$registry, image:$image, tag:$tag, digest:$digest,
+                  platform:"linux/amd64", scan:{status:"passed"}, signed:true}' \
+                > "artifact/${{ matrix.service }}.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: udeploy-artifact-${{ matrix.service }}
+          path: artifact/${{ matrix.service }}.json
+
+  notify:
+    # Runs only after every image is pushed, scanned and signed.
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with: {pattern: udeploy-artifact-*, merge-multiple: true, path: artifacts}
+      - name: Publish release to udeploy
+        env:
+          UDEPLOY_CI_TOKEN: ${{ secrets.UDEPLOY_CI_TOKEN }}
+        run: |
+          jq -s --arg version "${GITHUB_REF_NAME#v}" --arg sha "${GITHUB_SHA}" --arg tag "${GITHUB_REF_NAME}" \
+                --arg build "${GITHUB_RUN_ID}" \
+                --arg url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+                '{version:$version, commit_sha:$sha, tag:$tag, build_id:$build, build_url:$url, artifacts:.}' \
+                artifacts/*.json > release.json
+          status=$(curl -sS -o response.json -w '%{http_code}' -X POST "${{ vars.UDEPLOY_URL }}/v1/ci/artifacts/published" \
+            -H "Authorization: Bearer ${UDEPLOY_CI_TOKEN}" -H "Content-Type: application/json" \
+            -H "X-Request-ID: gh-${GITHUB_RUN_ID}" --data-binary @release.json)
+          cat response.json
+          case "$status" in 200|202) ;; *) echo "udeploy refused the release (HTTP $status)"; exit 1 ;; esac

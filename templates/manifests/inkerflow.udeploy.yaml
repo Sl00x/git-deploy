@@ -1,0 +1,89 @@
+# Example Application manifest (deploy.udeploy.io/v1) — three services from one repository.
+# Register it with:  curl -X PUT -H "Authorization: Bearer $UDEPLOY_TOKEN" -H "Content-Type: application/yaml" \
+#                         --data-binary @inkerflow.udeploy.yaml $UDEPLOY_URL/v1/projects/$PROJECT_ID/manifest
+# The manifest is a REQUEST: the server validates it against its own policy (no privileged mode,
+# host network, capabilities, host mounts or published ports are expressible) and refuses anything else.
+apiVersion: deploy.udeploy.io/v1
+kind: Application
+project: inkerflow
+source:
+  provider: gitlab
+  repository: group/inkerflow
+  defaultBranch: main
+build:
+  mode: external_ci
+  tagTemplate: "{semver}"
+  registryRef: registry-production
+release:
+  trigger: artifact_published
+  requireRegistryDigest: true
+  requireSignedArtifact: false   # true = fail closed until cosign verification ships (phase 2)
+  requireScanPass: true
+  environments:
+    staging:
+      branches: [develop]
+      autoDeploy: true
+    production:
+      tags: ["v*"]
+      autoDeploy: false
+      requireApproval: true      # four-eyes: requester cannot approve
+services:
+  api:
+    imageName: "{repository}_{service}"   # -> <registry>/<namespace>/inkerflow_api
+    internalPort: 8000
+    replicas: 2
+    user: "10001:10001"
+    healthcheck:
+      path: /health/ready
+      intervalSeconds: 5
+      startPeriodSeconds: 5
+    resources:
+      memory: 1g
+      cpus: 1.0
+      pids: 200
+    env:
+      APP_ENV: production
+    secretRefs:
+      DATABASE_URL: inkerflow/database-url    # mounted at /run/secrets/database_url, env DATABASE_URL_FILE
+    volumes:
+      - name: uploads
+        mountPath: /var/lib/inkerflow/uploads
+    routes:
+      - host: api.inkerflow.com
+        environments: [production]
+      - host: api.staging.inkerflow.com
+        environments: [staging]
+    deploy:
+      strategy: recreate       # blue_green / rolling are refused explicitly in this release
+      healthTimeoutSeconds: 120
+      drainTimeoutSeconds: 30
+  worker:
+    imageName: "{repository}_{service}"
+    command: ["celery", "-A", "app", "worker", "-l", "info"]
+    replicas: 1
+    user: "10001:10001"
+    secretRefs:
+      DATABASE_URL: inkerflow/database-url
+    resources: {memory: 512m, cpus: 0.5, pids: 128}
+    deploy:
+      strategy: recreate
+  frontend:
+    imageName: "{repository}_{service}"
+    internalPort: 8080
+    replicas: 2
+    user: "101:101"
+    healthcheck:
+      path: /
+    resources: {memory: 128m, cpus: 0.25, pids: 64}
+    routes:
+      - host: inkerflow.com
+        environments: [production]
+      - host: staging.inkerflow.com
+        environments: [staging]
+    deploy:
+      strategy: recreate
+targets:
+  staging:
+    hostPool: staging-docker
+  production:
+    hostPool: production-docker

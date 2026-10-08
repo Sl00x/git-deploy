@@ -1,0 +1,26 @@
+# Example: expose the control plane public API through the edge proxy when the control
+# plane runs on the same host. Copy to /var/lib/udeploy-agent/traefik/ after
+# `docker network connect udeploy_cp_edge udeploy-traefik`, and replace the host.
+# Only webhooks, the CI notification, enrolment and the admin API are published;
+# the agent API is NOT routed here (it is a separate mTLS listener on :8443).
+http:
+  routers:
+    udeploy-control-plane:
+      rule: "Host(`deploy.example.com`) && (PathPrefix(`/v1/`) || Path(`/health/live`))"
+      entryPoints: [websecure]
+      service: udeploy-control-plane
+      tls: {certResolver: letsencrypt}
+      middlewares: [udeploy-cp-headers, udeploy-cp-ratelimit]
+  middlewares:
+    udeploy-cp-headers:
+      headers:
+        stsSeconds: 31536000
+        contentTypeNosniff: true
+        frameDeny: true
+    udeploy-cp-ratelimit:
+      rateLimit: {average: 50, burst: 100}
+  services:
+    udeploy-control-plane:
+      loadBalancer:
+        servers:
+          - url: "http://udeploy-cp-api-1:8000"

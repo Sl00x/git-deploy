@@ -1,0 +1,107 @@
+# udeploy control plane (single VPS). Usage: see docs/deployment-guide.md
+#   docker compose -f infra/control-plane.compose.yml --env-file .env up -d
+# No service mounts the Docker socket. Only the agent mTLS listener (8443) is published;
+# the public API is reached through the edge proxy (infra/traefik) on the `udeploy_cp_edge` network.
+# One-off admin commands: docker compose -f infra/control-plane.compose.yml run --rm api udeploy-admin <cmd>
+name: udeploy-cp
+
+x-app: &app
+  image: ${UDEPLOY_CP_IMAGE:-udeploy/control-plane:0.1.0}
+  env_file: [../.env]
+  environment:
+    UDEPLOY_DATABASE_URL: postgresql+asyncpg://udeploy:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/udeploy
+    UDEPLOY_REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/0
+    UDEPLOY_PKI_DIR: /var/lib/udeploy-pki
+  volumes:
+    - pki:/var/lib/udeploy-pki
+  read_only: true
+  tmpfs: ["/tmp:size=64m"]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options: {max-size: 20m, max-file: "5"}
+  networks: [internal]
+  depends_on:
+    postgres: {condition: service_healthy}
+    redis: {condition: service_healthy}
+
+services:
+  postgres:
+    image: postgres:17.6-alpine
+    environment:
+      POSTGRES_USER: udeploy
+      POSTGRES_DB: udeploy
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U udeploy -d udeploy"]
+      interval: 5s
+      retries: 20
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    networks: [internal]
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD}", "--appendonly", "yes"]
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" --no-auth-warning ping | grep PONG"]
+      interval: 5s
+      retries: 20
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    networks: [internal]
+
+  migrate:
+    <<: *app
+    command: ["udeploy-admin", "migrate"]
+    restart: "no"
+
+  api:
+    <<: *app
+    networks: [internal, edge]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(urllib.request.urlopen('http://127.0.0.1:8000/health/ready').status!=200)"]
+      interval: 10s
+      retries: 6
+
+  agent-api:
+    <<: *app
+    command: ["python", "-m", "udeploy_api.mtls"]
+    networks: [internal, egress]
+    ports:
+      - "${UDEPLOY_AGENT_API_BIND:-0.0.0.0}:8443:8443"   # mutual TLS only; restrict with the host firewall
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+
+  worker:
+    <<: *app
+    command: ["celery", "-A", "udeploy_worker.celery_app", "worker", "--loglevel=INFO", "--concurrency=4", "-Q", "udeploy"]
+    networks: [internal, egress]   # needs to reach OCI registries to verify digests
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+
+  beat:
+    <<: *app
+    command: ["celery", "-A", "udeploy_worker.celery_app", "beat", "--loglevel=INFO", "--schedule=/tmp/celerybeat-schedule"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+
+volumes:
+  pgdata:
+  redisdata:
+  pki:
+
+networks:
+  internal:
+    internal: true   # postgres/redis: no egress, no published ports
+  egress:
+  edge:
+    name: udeploy_cp_edge   # joined by the edge proxy (see infra/traefik/dynamic/control-plane.yml)

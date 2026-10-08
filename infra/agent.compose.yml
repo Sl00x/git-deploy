@@ -1,0 +1,72 @@
+# Per-host execution plane: edge reverse proxy + deployment agent.
+#   docker compose -f infra/agent.compose.yml --env-file agent.env up -d
+# The agent mounts the Docker socket (unavoidable to drive the engine): it is root-equivalent
+# on this host and must be treated as critical infrastructure. Application containers never
+# get the socket. The proxy has NO socket either: it reads file-provider configuration
+# written atomically by the agent.
+name: udeploy-host
+
+services:
+  traefik:
+    image: traefik:v3.5.6
+    container_name: udeploy-traefik
+    # Static configuration (Traefik accepts a single static source: CLI flags here).
+    # Dynamic routes come only from files written atomically by the agent.
+    command:
+      - --global.checkNewVersion=false
+      - --global.sendAnonymousUsage=false
+      - --entryPoints.web.address=:80
+      - --entryPoints.web.http.redirections.entryPoint.to=websecure
+      - --entryPoints.web.http.redirections.entryPoint.scheme=https
+      - --entryPoints.websecure.address=:443
+      - --entryPoints.websecure.transport.lifeCycle.graceTimeOut=30s
+      - --entryPoints.websecure.transport.respondingTimeouts.idleTimeout=180s
+      - --providers.file.directory=/etc/traefik/dynamic
+      - --providers.file.watch=true
+      - --certificatesResolvers.letsencrypt.acme.email=${UDEPLOY_ACME_EMAIL:?set UDEPLOY_ACME_EMAIL}
+      - --certificatesResolvers.letsencrypt.acme.storage=/acme/acme.json
+      - --certificatesResolvers.letsencrypt.acme.httpChallenge.entryPoint=web
+      - --api.dashboard=false
+      - --accessLog.format=json
+      - --accessLog.fields.headers.defaultMode=drop
+      - --log.level=INFO
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/lib/udeploy-agent/traefik:/etc/traefik/dynamic:ro
+      - acme:/acme
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]   # infrastructure container, not configurable by projects
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: {max-size: 20m, max-file: "5"}
+
+  agent:
+    image: ${UDEPLOY_AGENT_IMAGE:-udeploy/agent:0.1.0}
+    container_name: udeploy-agent
+    environment:
+      UDEPLOY_AGENT_STATE_DIR: /var/lib/udeploy-agent
+      UDEPLOY_AGENT_ALLOWED_REGISTRIES: ${UDEPLOY_AGENT_ALLOWED_REGISTRIES:?list the registries this host may pull from}
+      UDEPLOY_AGENT_TRAEFIK_CONTAINER: udeploy-traefik
+      UDEPLOY_AGENT_TRAEFIK_DYNAMIC_DIR: /var/lib/udeploy-agent/traefik
+      UDEPLOY_AGENT_CERT_RESOLVER: letsencrypt
+      UDEPLOY_AGENT_PROBE_IMAGE: ${UDEPLOY_AGENT_PROBE_IMAGE:-busybox:1.37}
+      DOCKER_CONFIG: /var/lib/udeploy-agent/docker-config   # pull-only registry credentials
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Same absolute path inside and outside: compose `secrets.file` paths are resolved by the daemon.
+      - /var/lib/udeploy-agent:/var/lib/udeploy-agent
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    stop_grace_period: 15m   # let an in-flight deployment finish or roll back
+    logging:
+      driver: json-file
+      options: {max-size: 20m, max-file: "5"}
+    depends_on: [traefik]
+
+volumes:
+  acme:
